@@ -1,5 +1,34 @@
-
 use std::collections::hash_map::{HashMap};
+use std::collections::HashSet;
+
+/// Represents the type of a cell in the grid
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+pub enum CellType {
+    Dead,
+    Red,
+    Blue,
+}
+
+impl CellType {
+    /// Returns true if the cell is alive (red or blue)
+    pub fn is_alive(&self) -> bool {
+        match self {
+            CellType::Dead => false,
+            _ => true,
+        }
+    }
+    
+    /// Returns the cell type resulting from combining two cell types
+    /// Used when calculating next state - if red and blue cells create neighbors, what happens?
+    /// For now, we'll say red dominates (arbitrary choice)
+    pub fn combine(a: CellType, b: CellType) -> CellType {
+        match (a, b) {
+            (CellType::Dead, other) | (other, CellType::Dead) => other,
+            (CellType::Red, _) | (_, CellType::Red) => CellType::Red, // Red dominates
+            (CellType::Blue, CellType::Blue) => CellType::Blue,
+        }
+    }
+}
 
 #[derive(PartialEq,Eq,Hash,Clone,Copy)]
 pub struct Loc {
@@ -29,11 +58,9 @@ impl Loc {
   }
 }
 
-
-
 pub struct World {
-  buffer_1: HashMap<Loc,bool>,
-  buffer_2: HashMap<Loc,bool>,
+  buffer_1: HashMap<Loc, CellType>,
+  buffer_2: HashMap<Loc, CellType>,
   using_buffer_1: bool,
 }
 
@@ -60,10 +87,10 @@ impl World {
 
     for c in data.chars() {
       if c == dead_char {
-        world.set(&Loc { row, col }, false);
+        world.set(&Loc { row, col }, CellType::Dead);
         col += 1;
       } else if c == alive_char {
-        world.set(&Loc { row, col }, true);
+        world.set(&Loc { row, col }, CellType::Red); // Default to red for alive cells from config
         col += 1;
       } else if c == '\n' {
         row += 1;
@@ -78,7 +105,7 @@ impl World {
     return Ok(world);
   }
 
-  pub fn current_buffer(&self) -> &HashMap<Loc,bool> {
+  pub fn current_buffer(&self) -> &HashMap<Loc, CellType> {
     if self.using_buffer_1 { 
       &self.buffer_1 
     } else { 
@@ -86,7 +113,15 @@ impl World {
     }
   }
 
-  fn next_buffer(&mut self) -> &mut HashMap<Loc,bool> {
+  fn current_buffer_mut(&mut self) -> &mut HashMap<Loc, CellType> {
+      if self.using_buffer_1 {
+          &mut self.buffer_1
+      } else {
+          &mut self.buffer_2
+      }
+  }
+
+  fn next_buffer(&mut self) -> &mut HashMap<Loc, CellType> {
     if self.using_buffer_1 {
       &mut self.buffer_2
     } else { 
@@ -95,85 +130,163 @@ impl World {
   }
 
   /**
-   * Get aliveness status of a location in the world.
+   * Get cell type at a location in the world.
    */
-  pub fn get(&self, loc: &Loc) -> bool {
-    is_alive(self.current_buffer(), loc)
+  pub fn get(&self, loc: &Loc) -> CellType {
+    *self.current_buffer().get(loc).unwrap_or(&CellType::Dead)
   }
 
   /**
-   * Set aliveness status of a location in the world.
+   * Set cell type of a location in the world.
+   * This updates the *next* buffer, used during the simulation step.
    */
-  pub fn set(&mut self, loc: &Loc, alive: bool) {
+  pub fn set(&mut self, loc: &Loc, cell_type: CellType) {
     let next_buffer = self.next_buffer();
 
     // If this location is already in the HashMap, set its value. Otherwise,
     // add it as a new entry to the HashMap.
     match next_buffer.get_mut(loc) {
-      Some(val) => *val = alive,
-      None => { next_buffer.insert(*loc, alive); }
+      Some(val) => *val = cell_type,
+      None => { next_buffer.insert(*loc, cell_type); }
     };
 
-    if alive {
+    if cell_type.is_alive() {
       // If this location is now alive, we need to add any of its neighbors not 
       // already in the HashMap, to it.
       for neighbor in loc.neighbors().iter() {
-        if next_buffer.get(neighbor).is_none() {
-          next_buffer.insert(*neighbor, false);
-        }
+          // Use entry API for efficiency: only insert if the key doesn't exist.
+          next_buffer.entry(*neighbor).or_insert(CellType::Dead);
       }
     }
+  }
+
+  /**
+   * Set cell type of a location in the world *immediately* in the current buffer.
+   * Used for direct user interaction (e.g., clicking).
+   */
+  pub fn set_cell_now(&mut self, loc: &Loc, cell_type: CellType) {
+    let current_buffer = self.current_buffer_mut();
+
+    // Set the clicked location to the specified cell type. Insert if not present.
+    current_buffer.insert(*loc, cell_type);
+
+    // Also ensure neighbors are in the map (as dead) so they are considered
+    // in the next step and rendering.
+    for neighbor in loc.neighbors().iter() {
+        // Use entry API for efficiency: only insert if the key doesn't exist.
+        current_buffer.entry(*neighbor).or_insert(CellType::Dead);
+    }
+  }
+
+  /**
+   * Set location alive with RED cell type (for backward compatibility).
+   */
+  pub fn set_alive_now(&mut self, loc: &Loc) {
+    self.set_cell_now(loc, CellType::Red);
+  }
+
+  /**
+   * Swaps the current and next buffers and clears the new next buffer.
+   * Useful after initializing the world from a configuration.
+   */
+  pub fn swap_buffers_and_clear(&mut self) {
+    // Toggle buffers
+    self.using_buffer_1 = !self.using_buffer_1;
+    // Clear the old buffer (which is now the next buffer)
+    self.next_buffer().clear();
   }
 
   /**
    * One "tick" of the world.
    */
   pub fn step(&mut self) {
-    let keys: Vec<Loc> = self.current_buffer().keys().map(|&loc| loc).collect();
+    let current_buffer = self.current_buffer();
+    let mut candidates = HashSet::new();
 
-    for loc in keys.iter() {
-      let alive: bool = self.get(&loc);
-      let neighbors: [Loc;8] = loc.neighbors();
-      let alive_neighbors: usize = neighbors.iter()
-        .map(|neighbor| is_alive(self.current_buffer(), neighbor))
-        .filter(|alive| *alive)
-        .count();
-
-      // If this cell is dead and doesn't have any alive neighbors, we don't 
-      // need to check on the next cycle for whether or not it might become 
-      // alive, so we can omit it altogether from the next HashMap.
-      if alive_neighbors > 0 {
-        self.set(&loc, new_status(alive, alive_neighbors));
+    // Identify candidate cells: live cells and their neighbors
+    for (loc, cell_type) in current_buffer.iter() {
+      if cell_type.is_alive() {
+        candidates.insert(*loc);
+        for neighbor in loc.neighbors().iter() {
+            candidates.insert(*neighbor);
+        }
       }
     }
 
-    // Toggle buffers
-    self.using_buffer_1 = !self.using_buffer_1;
+    // Calculate the next state for candidate cells and store results
+    let mut next_states = Vec::new();
+    for loc in candidates.iter() {
+        let current_type = self.get(loc);
+        let current_alive = current_type.is_alive();
+        
+        let neighbors = loc.neighbors();
+        
+        // Count alive neighbors by type
+        let mut red_neighbors = 0;
+        let mut blue_neighbors = 0;
+        
+        for neighbor in neighbors.iter() {
+            match *current_buffer.get(neighbor).unwrap_or(&CellType::Dead) {
+                CellType::Red => red_neighbors += 1,
+                CellType::Blue => blue_neighbors += 1,
+                CellType::Dead => {}
+            }
+        }
+        
+        let total_alive_neighbors = red_neighbors + blue_neighbors;
+        
+        // Apply Conway's Game of Life rules to determine if the cell lives
+        let will_be_alive = if current_alive {
+            // Live cell stays alive with 2 or 3 neighbors
+            total_alive_neighbors == 2 || total_alive_neighbors == 3
+        } else {
+            // Dead cell becomes alive with exactly 3 neighbors
+            total_alive_neighbors == 3
+        };
+        
+        let next_type = if will_be_alive {
+            // Cell will be alive, determine its type
+            if current_alive {
+                // If already alive, maintain its current type
+                current_type
+            } else {
+                // If becoming alive, determine type based on neighbors
+                if red_neighbors > blue_neighbors {
+                    CellType::Red
+                } else if blue_neighbors > red_neighbors {
+                    CellType::Blue
+                } else if red_neighbors > 0 {
+                    // Equal numbers but at least one red
+                    CellType::Red  // Red dominates (arbitrary)
+                } else {
+                    // Shouldn't happen if total is 3, but just in case
+                    CellType::Blue
+                }
+            }
+        } else {
+            CellType::Dead
+        };
 
-    // Clear the old buffer
-    self.next_buffer().clear();
+        // Only store if the cell will be alive or if it was alive before
+        if will_be_alive || current_alive {
+             next_states.push((*loc, next_type));
+        }
+    }
+
+    // Drop the immutable borrow of current_buffer here
+    // Now apply the results to the next buffer
+    for (loc, next_type) in next_states {
+        self.set(&loc, next_type);
+    }
+
+    // Swap buffers and clear the new next buffer
+    self.swap_buffers_and_clear();
   }
 }
 
 /**
  * Whether or not the supplied location is alive, based on the supplied buffer.
  */
-fn is_alive(buffer: &HashMap<Loc,bool>, loc: &Loc) -> bool {
-  *buffer.get(loc).unwrap_or(&false)
-}
-
-
-/**
- * Given the status of one cell and the number of its neighbors that are alive,
- * determine whether it's alive in the next step. This is the core rule of 
- * Conway's Game of Life.
- */
-fn new_status(alive: bool, alive_neighbors: usize) -> bool {
-  if alive && (alive_neighbors == 2 || alive_neighbors == 3) {
-    true
-  } else if !alive && alive_neighbors == 3 {
-    true
-  } else {
-    false
-  }
+fn is_alive(buffer: &HashMap<Loc, CellType>, loc: &Loc) -> bool {
+  buffer.get(loc).map_or(false, |cell_type| cell_type.is_alive())
 }
